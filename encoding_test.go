@@ -170,6 +170,22 @@ func writeStringBytePerByte(w io.Writer, s string) error {
 	return nil
 }
 
+// The '=' scanner and the trailing-whitespace scanner must agree on what a
+// line ending is: a bare CR is not one. Whitespace before "=<bare CR>" is
+// therefore mid-line whitespace (the '=' is a literal, not a soft break) and
+// must be left unencoded. This inspects the rewritten stream directly because
+// the divergence is invisible after decoding (=20 decodes back to a space).
+func TestLenientQPReader_bareCRWhitespaceConsistency(t *testing.T) {
+	lqp := &lenientQPReader{wrapped: bufio.NewReader(strings.NewReader("a =\rX"))}
+	got, err := io.ReadAll(lqp)
+	if err != nil {
+		t.Fatalf("ReadAll failed: %v", err)
+	}
+	if want := "a =3D\rX"; string(got) != want {
+		t.Errorf("rewritten stream = %q, want %q", got, want)
+	}
+}
+
 func TestLenientQPReader(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -231,6 +247,45 @@ func TestLenientQPReader(t *testing.T) {
 			name:     "interleaved_valid_and_invalid",
 			input:    "foo=  \r\n=62ar", // malformed soft break, then valid hex
 			expected: "foobar",
+		},
+		{
+			// Regression: "=<spaces><bare CR>" must not be treated as a soft
+			// line break. A bare CR (not followed by LF) is not a line ending;
+			// the '=' is a literal. Previously the spaces were stripped, leaving
+			// "=\r" which the stdlib decoder rejected, making decoding *fail* on
+			// input the stdlib alone decodes fine.
+			name:     "equals_spaces_bare_cr",
+			input:    "=  \rX",
+			expected: "=  \rX",
+		},
+		{
+			// Bare CR soft break candidate without spaces: also a literal '='.
+			name:     "equals_bare_cr",
+			input:    "a=\rb",
+			expected: "a=\rb",
+		},
+		{
+			// Trailing whitespace at end of input (no line ending) must be
+			// stripped by the decoder, not preserved. Previously it was encoded
+			// to =20/=09, preserving whitespace RFC 2045 §6.7 says to delete.
+			name:     "trailing_whitespace_eof",
+			input:    "text   ",
+			expected: "text",
+		},
+		{
+			name:     "trailing_tab_eof",
+			input:    "text\t",
+			expected: "text",
+		},
+		{
+			// Regression: a malformed soft break "=<spaces>CRLF" whose CR sits
+			// at the last peekable byte of the bufio buffer (default 4096) must
+			// still be recognized as a soft break, not misclassified as a
+			// literal '=' — that would produce an over-long line the strict
+			// decoder rejects with "bufio: buffer full".
+			name:     "soft_break_at_buffer_boundary",
+			input:    "a=" + strings.Repeat(" ", 4094) + "\r\nb",
+			expected: "ab",
 		},
 	}
 

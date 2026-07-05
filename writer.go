@@ -30,6 +30,13 @@ func createWriter(w io.Writer, header *Header) (*Writer, error) {
 
 	mediaType, mediaParams, _ := header.ContentType()
 	if strings.HasPrefix(mediaType, "multipart/") {
+		if mediaParams == nil {
+			// ContentType returns a parsed media type with nil params when the
+			// parameters are malformed; the boundary assignment below needs a
+			// writable map.
+			mediaParams = make(map[string]string)
+		}
+
 		ww.mw = textproto.NewMultipartWriter(ww.w)
 
 		// Do not set ww's io.Closer for now: if this is a multipart entity but

@@ -3,8 +3,10 @@ package textproto
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/textproto"
 	"sort"
 	"strings"
@@ -25,6 +27,13 @@ func (f *headerField) raw() ([]byte, error) {
 	if f.b != nil {
 		return f.b, nil
 	} else {
+		// An empty field name is malformed (RFC 5322 section 2.2). ReadHeader
+		// preserves such fields via their raw bytes for round-trip fidelity,
+		// but refuse to freshly generate an illegal ": value" line.
+		if f.k == "" {
+			return nil, fmt.Errorf("field name is empty")
+		}
+
 		for pos, ch := range f.k {
 			// check if character is a printable US-ASCII except ':'
 			if !(ch >= '!' && ch < ':' || ch > ':' && ch <= '~') {
@@ -45,6 +54,10 @@ func (f *headerField) raw() ([]byte, error) {
 // The header representation is idempotent: if the header can be read and
 // written, the result will be exactly the same as the original (including
 // whitespace and header field ordering). This is required for e.g. DKIM.
+//
+// Byte-exact idempotency requires standard CRLF line endings. Input using
+// bare-LF line endings (which violates RFC 5322) is normalized to CRLF on
+// write.
 //
 // Mutating the header is restricted: the only two allowed operations are
 // inserting a new header field at the top and deleting a header field. This is
@@ -101,8 +114,14 @@ func HeaderFromMap(m map[string][]string) Header {
 
 // AddRaw adds the raw key, value pair to the header.
 //
-// The supplied byte slice should be a complete field in the "Key: Value" form
-// including trailing CRLF. If there is no colon in the input - AddRaw panics.
+// The supplied byte slice must be a single complete field in the "Key: Value"
+// form including a trailing newline, with the colon on the first physical
+// line. Interior line breaks are only permitted as folding (a newline
+// immediately followed by a space or tab). AddRaw panics if there is no colon,
+// or if the field is otherwise malformed (e.g. it contains an embedded
+// unfolded newline that would smuggle an additional field or a premature blank
+// line). A bare CR is accepted as an ordinary value byte, consistent with
+// ReadHeader, so any field obtained from HeaderFields.Raw can be added back.
 // No changes are made to kv contents and it will be copied into WriteHeader
 // output as is.
 //
@@ -112,6 +131,9 @@ func (h *Header) AddRaw(kv []byte) {
 	colon := bytes.IndexByte(kv, ':')
 	if colon == -1 {
 		panic("textproto: Header.AddRaw: missing colon")
+	}
+	if !isValidRawField(kv) {
+		panic("textproto: Header.AddRaw: malformed raw field")
 	}
 	k := textproto.CanonicalMIMEHeaderKey(string(trim(kv[:colon])))
 	v := trimAroundNewlines(kv[colon+1:])
@@ -408,9 +430,32 @@ func (h *Header) FieldsByKey(k string) HeaderFields {
 	return &headerFieldsByKey{h, textproto.CanonicalMIMEHeaderKey(k), -1}
 }
 
-func readLineSlice(r *bufio.Reader, line []byte) ([]byte, error) {
+// ErrHeaderTooBig is returned when a header block exceeds the maximum
+// permitted size. Callers can match it with errors.Is.
+var ErrHeaderTooBig = errors.New("textproto: header exceeds maximum size")
+
+// defaultMaxHeaderBytes bounds the size of a single header block (the top-level
+// message header is bounded separately by the message package; this default is
+// applied to MIME part headers, which are otherwise read from the raw stream
+// with no limit). See MultipartReader.MaxHeaderBytes.
+const defaultMaxHeaderBytes = 1 << 20 // 1 MB
+
+// readLineSlice reads a logical line into line, charging budget for the bytes
+// read, including the stripped line terminator (counted as CRLF; bare-LF input
+// is over-charged by one byte, which is fine for a defensive cap). Once the
+// budget would go negative, ErrHeaderTooBig is returned instead of buffering
+// without bound.
+func readLineSlice(r *bufio.Reader, line []byte, budget *int64) ([]byte, error) {
 	for {
 		l, more, err := r.ReadLine()
+		n := int64(len(l))
+		if !more {
+			n += 2
+		}
+		*budget -= n
+		if *budget < 0 {
+			return line, ErrHeaderTooBig
+		}
 		line = append(line, l...)
 		if err != nil {
 			return line, err
@@ -426,6 +471,33 @@ func readLineSlice(r *bufio.Reader, line []byte) ([]byte, error) {
 
 func isSpace(c byte) bool {
 	return c == ' ' || c == '\t'
+}
+
+// isValidRawField reports whether kv is a single well-formed raw header field:
+// it must end with a newline, the colon separating name and value must appear
+// on the first physical line, and interior newlines are only permitted as
+// folds (a newline immediately followed by SP or HT). This rejects raw fields
+// that would smuggle additional header fields or a premature blank line (body
+// injection) into the serialized output.
+//
+// A bare CR is accepted as an ordinary value byte: this parser does not treat
+// it as a line ending, and ReadHeader itself preserves such bytes, so a field
+// read from the wire can always be added back.
+func isValidRawField(kv []byte) bool {
+	if len(kv) == 0 || kv[len(kv)-1] != '\n' {
+		return false
+	}
+	if colon := bytes.IndexByte(kv, ':'); colon == -1 || colon > bytes.IndexByte(kv, '\n') {
+		return false
+	}
+	for i := 0; i < len(kv)-1; i++ {
+		// A LF is allowed only as the final terminator (excluded above) or as
+		// a fold, i.e. immediately followed by SP or HT (a continuation line).
+		if kv[i] == '\n' && !isSpace(kv[i+1]) {
+			return false
+		}
+	}
+	return true
 }
 
 func validHeaderKeyByte(b byte) bool {
@@ -456,10 +528,10 @@ func hasContinuationLine(r *bufio.Reader) bool {
 	return isSpace(c)
 }
 
-func readContinuedLineSlice(r *bufio.Reader) ([]byte, error) {
+func readContinuedLineSlice(r *bufio.Reader, budget *int64) ([]byte, error) {
 	// Read the first line. We preallocate slice that it enough
 	// for most fields.
-	line, err := readLineSlice(r, make([]byte, 0, 256))
+	line, err := readLineSlice(r, make([]byte, 0, 256), budget)
 	if err == io.EOF && len(line) == 0 {
 		// Header without a body
 		return nil, nil
@@ -475,8 +547,14 @@ func readContinuedLineSlice(r *bufio.Reader) ([]byte, error) {
 
 	// Read continuation lines.
 	for hasContinuationLine(r) {
-		line, err = readLineSlice(r, line)
-		if err != nil {
+		line, err = readLineSlice(r, line, budget)
+		if err == ErrHeaderTooBig {
+			// Unlike real I/O errors, which bufio retains and returns again on
+			// the next read, this error is synthesized here, so it must be
+			// propagated immediately; deferring it would hand the caller a
+			// silently truncated field.
+			return nil, err
+		} else if err != nil {
 			break // bufio will keep err until next read.
 		}
 
@@ -525,11 +603,27 @@ func trimAroundNewlines(v []byte) string {
 // reading from an io.LimitedReader or a similar Reader to bound the size of
 // headers.
 func ReadHeader(r *bufio.Reader) (Header, error) {
+	return readHeader(r, -1)
+}
+
+// readHeader reads a MIME header from r. If maxBytes >= 0, the header block is
+// bounded to that many bytes and ErrHeaderTooBig is returned if it is exceeded.
+// A negative maxBytes means no limit (the caller is expected to bound r
+// itself, e.g. via an io.LimitedReader).
+func readHeader(r *bufio.Reader, maxBytes int64) (Header, error) {
 	fs := make([]*headerField, 0, 32)
+
+	// A negative maxBytes means no limit; an effectively-infinite budget keeps
+	// a single code path in the line-reading helpers.
+	remaining := int64(math.MaxInt64)
+	if maxBytes >= 0 {
+		remaining = maxBytes
+	}
+	budget := &remaining
 
 	// The first line cannot start with a leading space.
 	if buf, err := r.Peek(1); err == nil && isSpace(buf[0]) {
-		line, err := readLineSlice(r, nil)
+		line, err := readLineSlice(r, nil, budget)
 		if err != nil {
 			return newHeader(fs), err
 		}
@@ -538,9 +632,17 @@ func ReadHeader(r *bufio.Reader) (Header, error) {
 	}
 
 	for {
-		kv, err := readContinuedLineSlice(r)
+		kv, err := readContinuedLineSlice(r, budget)
 		if len(kv) == 0 {
 			return newHeader(fs), err
+		}
+
+		// Charge the slack capacity retained by the field's backing array (the
+		// 256-byte preallocation dominates for tiny fields) so that a flood of
+		// minimal fields cannot retain memory far beyond the budget.
+		*budget -= int64(cap(kv) - len(kv))
+		if *budget < 0 {
+			return newHeader(fs), ErrHeaderTooBig
 		}
 
 		// Key ends at first colon; should not have trailing spaces but they
@@ -562,12 +664,11 @@ func ReadHeader(r *bufio.Reader) (Header, error) {
 
 		key := textproto.CanonicalMIMEHeaderKey(string(keyBytes))
 
-		// As per RFC 7230 field-name is a token, tokens consist of one or more
-		// chars. We could return a an error here, but better to be liberal in
-		// what we accept, so if we get an empty key, skip it.
-		if key == "" {
-			continue
-		}
+		// As per RFC 7230 a field-name is a token of one or more chars, so an
+		// empty key (a leading colon) is malformed. We keep the field anyway,
+		// preserving its raw bytes: dropping it would break the read/write
+		// idempotency guarantee (required for DKIM) and hide the line from this
+		// parser while a downstream parser might still see it.
 
 		i++ // skip colon
 		v := kv[i:]
@@ -583,6 +684,15 @@ func ReadHeader(r *bufio.Reader) (Header, error) {
 
 func foldLine(v string, maxlen int) (line, next string, ok bool) {
 	ok = true
+
+	// Guard against a non-positive fold width, which would otherwise produce
+	// negative slice indices below. This happens when the field name alone is
+	// as long as (or longer than) the target line width. Callers retry with a
+	// larger width and ultimately emit the remainder verbatim if no fold is
+	// possible.
+	if maxlen < 1 {
+		maxlen = 1
+	}
 
 	// We'll need to fold before maxlen
 	foldBefore := maxlen + 1
@@ -650,12 +760,44 @@ func formatHeaderField(k, v string) string {
 			keylen = len(s)
 		}
 
-		// First try with a soft limit
-		l, next, ok := foldLine(v, preferredHeaderLen-keylen)
+		// First try with a soft limit. Skip it when the key already fills the
+		// preferred width (a very long field name), which would leave no room
+		// for the value on the first line.
+		softTried := preferredHeaderLen-keylen >= 1
+		var l, next string
+		ok := false
+		if softTried {
+			l, next, ok = foldLine(v, preferredHeaderLen-keylen)
+		}
 		if !ok {
 			// Folding failed to preserve the original header field value. Try
 			// with a larger, hard limit.
-			l, next, _ = foldLine(v, maxHeaderLen-keylen)
+			var hardOK bool
+			l, next, hardOK = foldLine(v, maxHeaderLen-keylen)
+			if !hardOK && !softTried {
+				// The field name alone crowds the hard line limit, so folding
+				// would split the value at an arbitrary point, inserting
+				// whitespace that changes it. Emit the remainder verbatim
+				// (overflowing the line-length limit) rather than corrupting
+				// the value. For ordinary field names the whitespace insertion
+				// is kept instead: there the 998-octet limit takes precedence
+				// (RFC 5322 section 2.1.1).
+				s += v
+				if !strings.HasSuffix(v, "\n") {
+					s += "\r\n"
+				}
+				break
+			}
+		}
+		if next == v {
+			// No progress is possible: the value cannot be folded onto a
+			// shorter line. Emit the remainder verbatim (overflowing the
+			// line-length limit) rather than looping forever.
+			s += v
+			if !strings.HasSuffix(v, "\n") {
+				s += "\r\n"
+			}
+			break
 		}
 		v = next
 		s += l

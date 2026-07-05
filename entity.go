@@ -2,7 +2,6 @@ package message
 
 import (
 	"bufio"
-	"errors"
 	"io"
 	"math"
 	"strings"
@@ -21,6 +20,11 @@ type Entity struct {
 
 	mediaType   string
 	mediaParams map[string]string
+
+	// maxHeaderBytes bounds the header block of each MIME part within this
+	// entity. Zero means the textproto default; it is populated from
+	// ReadOptions.MaxHeaderBytes and inherited by child parts.
+	maxHeaderBytes int64
 }
 
 // New makes a new message with the provided header and body. The entity's
@@ -84,7 +88,10 @@ func NewMultipart(header Header, parts []*Entity) (*Entity, error) {
 
 const defaultMaxHeaderBytes = 1 << 20 // 1 MB
 
-var errHeaderTooBig = errors.New("message: header exceeds maximum size")
+// errHeaderTooBig is the same value as textproto.ErrHeaderTooBig, so callers
+// can match header-size errors from both the top-level message header and
+// MIME part headers with a single errors.Is target.
+var errHeaderTooBig = textproto.ErrHeaderTooBig
 
 // limitedReader is the same as io.LimitedReader, but returns a custom error.
 type limitedReader struct {
@@ -107,7 +114,9 @@ func (lr *limitedReader) Read(p []byte) (int, error) {
 // ReadOptions are options for ReadWithOptions.
 type ReadOptions struct {
 	// MaxHeaderBytes limits the maximum permissible size of a message header
-	// block. If exceeded, an error will be returned.
+	// block. It applies to the top-level message header and to the header of
+	// each MIME part parsed from the returned entity. If exceeded, an error
+	// matching textproto.ErrHeaderTooBig will be returned.
 	//
 	// Set to -1 for no limit, set to 0 for the default value (1MB).
 	MaxHeaderBytes int64
@@ -147,7 +156,11 @@ func ReadWithOptions(r io.Reader, opts *ReadOptions) (*Entity, error) {
 
 	lr.N = math.MaxInt64
 
-	return New(Header{h}, br)
+	e, err := New(Header{h}, br)
+	if e != nil {
+		e.maxHeaderBytes = opts.MaxHeaderBytes
+	}
+	return e, err
 }
 
 // Read reads a message from r. The message's encoding and charset are
@@ -170,7 +183,11 @@ func (e *Entity) MultipartReader() MultipartReader {
 	if mb, ok := e.Body.(*multipartBody); ok {
 		return mb
 	}
-	return &multipartReader{textproto.NewMultipartReader(e.Body, e.mediaParams["boundary"])}
+	tr := textproto.NewMultipartReader(e.Body, e.mediaParams["boundary"])
+	if e.maxHeaderBytes != 0 {
+		tr.MaxHeaderBytes = e.maxHeaderBytes
+	}
+	return &multipartReader{r: tr, maxHeaderBytes: e.maxHeaderBytes}
 }
 
 // writeBodyTo writes this entity's body to w (without the header).

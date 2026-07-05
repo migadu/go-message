@@ -9,12 +9,19 @@ import (
 func parseHeaderWithParams(s string) (f string, params map[string]string, err error) {
 	f, params, err = mime.ParseMediaType(s)
 	if err != nil {
-		return s, nil, err
+		// mime.ParseMediaType still returns a usable media type when only a
+		// parameter is invalid (e.g. an unquoted filename with a space). Keep
+		// it so callers can rely on the type/subtype (and disposition type)
+		// even when the parameters can't be parsed. Only fall back to the raw
+		// value when no media type could be parsed at all.
+		if f == "" {
+			return s, nil, err
+		}
 	}
 	for k, v := range params {
 		params[k], _ = decodeHeader(v)
 	}
-	return
+	return f, params, err
 }
 
 func formatHeaderWithParams(f string, params map[string]string) string {

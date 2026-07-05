@@ -106,6 +106,23 @@ func TestHeader_MessageID(t *testing.T) {
 	}
 }
 
+// A Message-ID field is exactly one msg-id (plus CFWS). Trailing non-CFWS
+// content is malformed and must be reported as an error, consistent with
+// MsgIDList, instead of being silently ignored.
+func TestHeader_MessageID_trailingGarbage(t *testing.T) {
+	for _, raw := range []string{
+		"<a@b> total garbage here",
+		"<a@b> <second@id>",
+		"<a@b> !!!",
+	} {
+		var h mail.Header
+		h.Set("Message-ID", raw)
+		if id, err := h.MessageID(); err == nil {
+			t.Errorf("MessageID(%q) = %q, want error", raw, id)
+		}
+	}
+}
+
 func TestHeader_MsgIDList(t *testing.T) {
 	tests := []struct {
 		raw    string

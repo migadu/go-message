@@ -290,7 +290,14 @@ func (h *Header) MessageID() (string, error) {
 	}
 
 	p := headerParser{v}
-	return p.parseMsgID()
+	msgID, err := p.parseMsgID()
+	if err != nil {
+		return "", err
+	}
+	if !p.empty() {
+		return "", fmt.Errorf("mail: invalid Message-ID: unexpected trailing characters %q", p.s)
+	}
+	return msgID, nil
 }
 
 // MsgIDList parses a list of message identifiers. It returns message

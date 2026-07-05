@@ -53,6 +53,7 @@ func NewMultipartReader(r io.Reader, boundary string) *MultipartReader {
 		nlDashBoundary:   b[:len(b)-2],
 		dashBoundaryDash: b[2:],
 		dashBoundary:     b[2 : len(b)-2],
+		MaxHeaderBytes:   defaultMaxHeaderBytes,
 	}
 }
 
@@ -84,7 +85,11 @@ func newPart(mr *MultipartReader) (*Part, error) {
 }
 
 func (bp *Part) populateHeaders() error {
-	header, err := ReadHeader(bp.mr.bufReader)
+	// Bound the part header size. Unlike the top-level message header (which is
+	// bounded by the message package before parsing), a part header is read
+	// straight from the multipart stream, so without a limit a single crafted
+	// part could force unbounded buffering (DoS).
+	header, err := readHeader(bp.mr.bufReader, bp.mr.MaxHeaderBytes)
 	if err == nil {
 		bp.Header = header
 	}
@@ -226,6 +231,12 @@ func (p *Part) Close() error {
 // MultipartReader's underlying parser consumes its input as needed. Seeking
 // isn't supported.
 type MultipartReader struct {
+	// MaxHeaderBytes bounds the size of each part's header block; when
+	// exceeded, NextPart returns an error matching ErrHeaderTooBig. A negative
+	// value disables the limit. It may be modified before the first call to
+	// NextPart. NewMultipartReader initializes it to a 1 MB default.
+	MaxHeaderBytes int64
+
 	bufReader *bufio.Reader
 
 	currentPart *Part

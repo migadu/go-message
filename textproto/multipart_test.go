@@ -7,6 +7,7 @@ package textproto
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -15,6 +16,57 @@ import (
 	"strings"
 	"testing"
 )
+
+// A part header must be bounded in size, like the top-level message header.
+// Otherwise a single crafted part can force the reader to buffer unbounded
+// data into memory (DoS). See ReadHeader's own doc contract. The error must
+// be matchable with errors.Is(err, ErrHeaderTooBig).
+func TestMultipartReader_partHeaderLimit(t *testing.T) {
+	big := strings.Repeat("A", defaultMaxHeaderBytes+4096) // over the default cap
+	body := "--b\r\nX-Big: " + big + "\r\n\r\nhi\r\n--b--\r\n"
+
+	mr := NewMultipartReader(strings.NewReader(body), "b")
+	if _, err := mr.NextPart(); !errors.Is(err, ErrHeaderTooBig) {
+		t.Fatalf("NextPart() = %v, want ErrHeaderTooBig", err)
+	}
+}
+
+// The part header limit is a public knob: raising it or disabling it (negative
+// value) must allow headers the default cap rejects.
+func TestMultipartReader_partHeaderLimitConfigurable(t *testing.T) {
+	big := strings.Repeat("A", defaultMaxHeaderBytes+4096)
+	body := "--b\r\nX-Big: " + big + "\r\n\r\nhi\r\n--b--\r\n"
+
+	mr := NewMultipartReader(strings.NewReader(body), "b")
+	mr.MaxHeaderBytes = -1 // no limit
+	p, err := mr.NextPart()
+	if err != nil {
+		t.Fatalf("NextPart() with no limit returned error: %v", err)
+	}
+	if got := p.Header.Get("X-Big"); got != big {
+		t.Errorf("Get(\"X-Big\") length = %d, want %d", len(got), len(big))
+	}
+
+	mr = NewMultipartReader(strings.NewReader("--b\r\nX-Small: v\r\n\r\nhi\r\n--b--\r\n"), "b")
+	mr.MaxHeaderBytes = 4 // too small even for the tiny header
+	if _, err := mr.NextPart(); !errors.Is(err, ErrHeaderTooBig) {
+		t.Fatalf("NextPart() with tiny limit = %v, want ErrHeaderTooBig", err)
+	}
+}
+
+// A normally-sized part header must still be accepted.
+func TestMultipartReader_partHeaderWithinLimit(t *testing.T) {
+	body := "--b\r\nX-Small: value\r\n\r\nhi\r\n--b--\r\n"
+
+	mr := NewMultipartReader(strings.NewReader(body), "b")
+	p, err := mr.NextPart()
+	if err != nil {
+		t.Fatalf("NextPart() returned error: %v", err)
+	}
+	if got := p.Header.Get("X-Small"); got != "value" {
+		t.Errorf("Get(\"X-Small\") = %q, want %q", got, "value")
+	}
+}
 
 func TestBoundaryLine(t *testing.T) {
 	mr := NewMultipartReader(strings.NewReader(""), "myBoundary")

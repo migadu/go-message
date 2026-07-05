@@ -5,7 +5,54 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 )
+
+// When the internal writer fails to initialise (e.g. an invalid charset on a
+// multipart entity), reading the body must return that error on every call
+// rather than deadlocking on a pipe that has no writer.
+func TestMultipartBody_readErrorDoesNotHang(t *testing.T) {
+	var h Header
+	h.Set("Content-Type", "multipart/mixed; charset=bogus-charset; boundary=abc")
+	child, _ := New(Header{}, strings.NewReader("hi"))
+	e, _ := NewMultipart(h, []*Entity{child})
+
+	buf := make([]byte, 64)
+	if _, err := e.Body.Read(buf); err == nil {
+		t.Fatal("expected an error from the first Read, got nil")
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.Body.Read(buf)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected an error from the second Read, got nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second Read deadlocked")
+	}
+}
+
+// A multipart Content-Type whose parameters are malformed (so no boundary can
+// be parsed) yields a parsed media type with a nil params map. Writing such an
+// entity must generate a boundary, not panic on a nil-map assignment.
+func TestWriter_multipartMalformedParams(t *testing.T) {
+	var h Header
+	h.Set("Content-Type", "Multipart/Mixed; foo bar")
+	e, err := New(h, strings.NewReader("body"))
+	if err != nil {
+		t.Fatalf("New() = %v", err)
+	}
+
+	var b strings.Builder
+	if err := e.WriteTo(&b); err != nil {
+		t.Fatalf("WriteTo() = %v", err)
+	}
+}
 
 func TestWriter_multipartWithoutCreatePart(t *testing.T) {
 	var h Header

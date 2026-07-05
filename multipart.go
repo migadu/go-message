@@ -20,6 +20,11 @@ type MultipartReader interface {
 
 type multipartReader struct {
 	r *textproto.MultipartReader
+
+	// maxHeaderBytes is inherited from the parent entity and propagated to
+	// child parts so that nested multiparts honor the same limit. Zero means
+	// the textproto default.
+	maxHeaderBytes int64
 }
 
 // NextPart implements MultipartReader.
@@ -28,7 +33,11 @@ func (r *multipartReader) NextPart() (*Entity, error) {
 	if err != nil {
 		return nil, err
 	}
-	return New(Header{p.Header}, p)
+	e, err := New(Header{p.Header}, p)
+	if e != nil {
+		e.maxHeaderBytes = r.maxHeaderBytes
+	}
+	return e, err
 }
 
 // Close implements io.Closer.
@@ -55,6 +64,9 @@ func (m *multipartBody) Read(p []byte) (n int, err error) {
 		var err error
 		m.w, err = createWriter(w, &m.header)
 		if err != nil {
+			// Fail the pipe so subsequent reads observe the error instead of
+			// blocking forever on a pipe whose writer was never started.
+			w.CloseWithError(err)
 			return 0, err
 		}
 

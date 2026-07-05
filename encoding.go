@@ -62,6 +62,11 @@ func encodingWriter(enc string, w io.Writer) (io.WriteCloser, error) {
 	case "base64":
 		wc = base64.NewEncoder(base64.StdEncoding, &lineWrapper{w: w, maxLineLen: 76})
 	case "7bit", "8bit":
+		// RFC 5322 §2.1.1 limits lines to 998 octets. For 7bit/8bit the body is
+		// written verbatim, so a line longer than that is hard-wrapped by
+		// inserting a CRLF, which becomes a real line break in the decoded body.
+		// Content that needs wrapping isn't truly 7bit/8bit-representable and
+		// should be re-encoded as quoted-printable or base64 by the caller.
 		wc = nopCloser{&lineWrapper{w: w, maxLineLen: 998}}
 	case "binary", "":
 		wc = nopCloser{w}
@@ -90,16 +95,43 @@ func (r *whitespaceReplacingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// lenientQPReader fixes malformed quoted-printable encoding while preserving valid sequences.
+// lenientQPReader rewrites malformed quoted-printable so the strict stdlib
+// decoder accepts it, while preserving valid sequences. A "line ending" here is
+// CRLF or a bare LF; a bare CR (not followed by LF) is not a line ending.
 // It handles the following cases:
-// 1. "=[spaces]\r\n" -> Soft line break (malformed). Strips spaces to "=\r\n".
-// 2. "=[spaces][other]" -> Malformed literal. Encodes to "=3D[spaces][other]".
-// 3. "=62" -> Valid QP. Preserved.
-// 4. "=\r\n" -> Valid soft break. Preserved.
-// 5. "[spaces]\r\n" -> Trailing whitespace. Encodes to "=20" or "=09".
+//  1. "=[ws](CR)LF" (whitespace before a soft break): the whitespace is
+//     stripped, yielding a valid "=(CR)LF" soft break.
+//  2. "=[ws]X" or "=X" where X is not a valid hex pair: the '=' is a literal,
+//     encoded as "=3D". This includes "=" followed by a bare CR.
+//  3. "=62" and other valid "=XX" hex sequences: preserved.
+//  4. "=(CR)LF" valid soft break: preserved.
+//  5. Whitespace immediately before a soft break is encoded to "=20"/"=09" to
+//     preserve it (the decoder would otherwise strip it). Whitespace before a
+//     real line ending, or at end of input, is left for the decoder to strip
+//     per RFC 2045 §6.7.
 type lenientQPReader struct {
 	wrapped *bufio.Reader
 	pending []byte // data waiting to be read (e.g. from expansion)
+}
+
+// lineEndingAhead reports whether the byte c, previously peeked at 0-based
+// offset off in the wrapped reader, begins a line ending: a LF, or a CR
+// followed by LF. A bare CR is not a line ending. When the byte after a CR
+// cannot be peeked because the buffer is exhausted, the CR is treated as a
+// line ending (preserving lenient behavior at the buffer boundary); at EOF a
+// trailing CR is genuinely bare and is not a line ending.
+func (r *lenientQPReader) lineEndingAhead(off int, c byte) bool {
+	switch c {
+	case '\n':
+		return true
+	case '\r':
+		peeked, err := r.wrapped.Peek(off + 2)
+		if len(peeked) > off+1 {
+			return peeked[off+1] == '\n'
+		}
+		return err != io.EOF
+	}
+	return false
 }
 
 func (r *lenientQPReader) Read(p []byte) (int, error) {
@@ -126,23 +158,15 @@ func (r *lenientQPReader) Read(p []byte) (int, error) {
 			// Look ahead to categorize
 			peekSize := 2
 			spacesCount := 0
-			foundEnd := false
 			var targetChar byte
 			isSoftBreak := false
 			isLiteral := false
 
 			for {
-				peaked, err := r.wrapped.Peek(peekSize)
+				peaked, _ := r.wrapped.Peek(peekSize)
 				if len(peaked) < peekSize {
-					if err != nil && err != io.EOF {
-						// Error peeking, treat as literal to be safe
-						isLiteral = true
-						foundEnd = true
-						break
-					}
-					// EOF reached
-					isLiteral = true
-					foundEnd = true
+					// EOF or peek error (e.g. buffer full): targetChar stays 0
+					// and the switch below classifies the '=' as a literal.
 					break
 				}
 
@@ -154,37 +178,32 @@ func (r *lenientQPReader) Read(p []byte) (int, error) {
 				}
 
 				targetChar = c
-				foundEnd = true
 				break
 			}
 
-			if !foundEnd {
-				// Buffer likely full or scan too long
-				isLiteral = true
-			} else {
-				if targetChar == '\r' || targetChar == '\n' {
-					if spacesCount > 0 {
-						// Malformed soft break: =[spaces]\r\n
-						isSoftBreak = true
-					}
-					// Else valid soft break: =\r\n (fall through to default copy)
-				} else {
-					// Not a soft break
-					// Check if valid Hex if no spaces (e.g. =62)
-					if spacesCount == 0 && isHex(targetChar) {
-						// Need one more char for full hex check
-						peaked3, _ := r.wrapped.Peek(3)
-						if len(peaked3) >= 3 && isHex(peaked3[2]) {
-							// Valid QP hex: =XX. Preserved.
-						} else {
-							// =X? or =X[EOF]. Malformed.
-							isLiteral = true
-						}
-					} else {
-						// =[spaces]X or =[bad char]. Malformed literal.
-						isLiteral = true
-					}
+			// Determine whether targetChar begins a soft line break. A soft
+			// break is "=" + optional whitespace + a line ending. A bare CR
+			// (not followed by LF) is NOT a line ending, so in that case the
+			// '=' is a literal.
+			switch {
+			case r.lineEndingAhead(peekSize-1, targetChar):
+				if spacesCount > 0 {
+					// Malformed soft break: =[spaces](CR)LF. Strip spaces.
+					isSoftBreak = true
 				}
+				// Else valid soft break: =(CR)LF. Fall through to default copy.
+			case spacesCount == 0 && isHex(targetChar):
+				// Possibly valid QP hex (e.g. =62): need the second digit.
+				peaked3, _ := r.wrapped.Peek(3)
+				if len(peaked3) < 3 || !isHex(peaked3[2]) {
+					// =X? or =X[EOF]. Malformed.
+					isLiteral = true
+				}
+				// Else valid QP hex: =XX. Preserved.
+			default:
+				// =[spaces]X, =[bad char], =[bare CR], or =[EOF]. Malformed
+				// literal.
+				isLiteral = true
 			}
 
 			if isLiteral {
@@ -218,8 +237,9 @@ func (r *lenientQPReader) Read(p []byte) (int, error) {
 			for {
 				peaked, _ := r.wrapped.Peek(peekSize)
 				if len(peaked) < peekSize {
-					// EOF after spaces -> trailing
-					isTrailing = true
+					// EOF after the whitespace run. Leave it unencoded so the
+					// decoder strips it (RFC 2045 §6.7: trailing whitespace on
+					// the last line is deleted).
 					break
 				}
 				c := peaked[peekSize-1]
@@ -247,7 +267,11 @@ func (r *lenientQPReader) Read(p []byte) (int, error) {
 							subPeekSize++
 							continue
 						}
-						if sc == '\r' || sc == '\n' {
+						// The whitespace run precedes a soft break only if a
+						// line ending follows the '='; a bare CR is not a line
+						// ending (the '=' branch treats it as a literal), so
+						// the whitespace stays mid-line and is left as-is.
+						if r.lineEndingAhead(subPeekSize-1, sc) {
 							isTrailing = true
 						}
 						break

@@ -9,6 +9,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/emersion/go-message/textproto"
 )
 
 func testMakeEntity() *Entity {
@@ -227,6 +229,39 @@ func TestReadWithOptions(t *testing.T) {
 				t.Errorf("ReadWithOptions() = %t but want: %t", gotErr, test.wantErr)
 			}
 		})
+	}
+}
+
+// ReadOptions.MaxHeaderBytes applies to MIME part headers too: -1 (no limit)
+// must allow part headers over the built-in 1MB default, and a small limit
+// must reject part headers that exceed it with an error matching
+// textproto.ErrHeaderTooBig.
+func TestReadWithOptions_partHeaderLimit(t *testing.T) {
+	makeMsg := func(fieldSize int) string {
+		return "Content-Type: multipart/mixed; boundary=BOUND\r\n\r\n" +
+			"--BOUND\r\n" +
+			"X-Big: " + strings.Repeat("A", fieldSize) + "\r\n" +
+			"\r\n" +
+			"body\r\n" +
+			"--BOUND--\r\n"
+	}
+
+	// No limit: a part header over the built-in default must parse.
+	e, err := ReadWithOptions(strings.NewReader(makeMsg(defaultMaxHeaderBytes+4096)), &ReadOptions{MaxHeaderBytes: -1})
+	if err != nil {
+		t.Fatalf("ReadWithOptions() = %v", err)
+	}
+	if _, err := e.MultipartReader().NextPart(); err != nil {
+		t.Errorf("NextPart() with no limit returned error: %v", err)
+	}
+
+	// Small limit: a part header exceeding it must be rejected.
+	e, err = ReadWithOptions(strings.NewReader(makeMsg(1024)), &ReadOptions{MaxHeaderBytes: 512})
+	if err != nil {
+		t.Fatalf("ReadWithOptions() = %v", err)
+	}
+	if _, err := e.MultipartReader().NextPart(); !errors.Is(err, textproto.ErrHeaderTooBig) {
+		t.Errorf("NextPart() with small limit = %v, want textproto.ErrHeaderTooBig", err)
 	}
 }
 

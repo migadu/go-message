@@ -40,6 +40,33 @@ func ExampleReader() {
 	}
 }
 
+// A part with a malformed Content-Disposition parameter (e.g. an unquoted
+// filename containing a space) must still be classified by its disposition
+// type. Previously the parse error caused the raw header value to drive
+// classification, turning an attachment into an *InlineHeader.
+func TestReader_attachmentWithMalformedDispositionParam(t *testing.T) {
+	msg := "Content-Type: multipart/mixed; boundary=BOUND\r\n\r\n" +
+		"--BOUND\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"Content-Disposition: attachment; filename=My Notes.txt\r\n" +
+		"\r\n" +
+		"secret attachment body\r\n" +
+		"--BOUND--\r\n"
+
+	mr, err := mail.CreateReader(strings.NewReader(msg))
+	if err != nil {
+		t.Fatalf("CreateReader() = %v", err)
+	}
+	p, err := mr.NextPart()
+	if err != nil {
+		t.Fatalf("NextPart() = %v", err)
+	}
+	io.Copy(io.Discard, p.Body)
+	if _, ok := p.Header.(*mail.AttachmentHeader); !ok {
+		t.Errorf("part classified as %T, want *mail.AttachmentHeader", p.Header)
+	}
+}
+
 func testReader(t *testing.T, r io.Reader) {
 	mr, err := mail.CreateReader(r)
 	if err != nil {
