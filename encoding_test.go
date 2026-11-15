@@ -62,6 +62,60 @@ func TestDecode_error(t *testing.T) {
 	}
 }
 
+// commentedEncodings returns Content-Transfer-Encoding field values naming
+// enc with RFC 822 comments around it, which "have no semantic content and
+// should be ignored during MIME processing" (RFC 2045 section 1).
+func commentedEncodings(enc string) []string {
+	return []string{
+		enc + " (comment)",
+		"(comment) " + strings.ToUpper(enc),
+		enc + "(no space)",
+		"(a (nested) comment) " + enc + " (with a \\) quoted-pair)",
+	}
+}
+
+func TestDecode_comment(t *testing.T) {
+	for _, test := range testEncodings {
+		for _, enc := range commentedEncodings(test.enc) {
+			r, err := encodingReader(enc, strings.NewReader(test.encoded))
+			if err != nil {
+				t.Errorf("encodingReader(%q) = %v, want no error", enc, err)
+			} else if b, err := ioutil.ReadAll(r); err != nil {
+				t.Errorf("reading encoding %q: %v", enc, err)
+			} else if s := string(b); s != test.decoded {
+				t.Errorf("encoding %q decoded to %q, want %q", enc, s, test.decoded)
+			}
+		}
+	}
+}
+
+func TestDecode_commentError(t *testing.T) {
+	// A comment is not part of the mechanism, and it separates tokens.
+	for _, enc := range []string{"idontexist (comment)", "base(comment)64"} {
+		if _, err := encodingReader(enc, strings.NewReader("")); err == nil {
+			t.Errorf("encodingReader(%q): expected an error", enc)
+		}
+	}
+}
+
+func TestEncode_comment(t *testing.T) {
+	for _, test := range testEncodings {
+		for _, enc := range commentedEncodings(test.enc) {
+			var b bytes.Buffer
+			wc, err := encodingWriter(enc, &b)
+			if err != nil {
+				t.Errorf("encodingWriter(%q) = %v, want no error", enc, err)
+				continue
+			}
+			io.WriteString(wc, test.decoded)
+			wc.Close()
+			if s := b.String(); s != test.encoded {
+				t.Errorf("encoding %q encoded to %q, want %q", enc, s, test.encoded)
+			}
+		}
+	}
+}
+
 func TestEncode(t *testing.T) {
 	for _, test := range testEncodings {
 		var b bytes.Buffer
