@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/emersion/go-message/textproto"
+	"golang.org/x/text/encoding/charmap"
 )
 
 func testMakeEntity() *Entity {
@@ -522,5 +523,61 @@ func TestWalk_multipart(t *testing.T) {
 
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("Entity.Walk() =\n%#v\nbut want:\n%#v", got, want)
+	}
+}
+
+func TestRead_charsetTrailingSemicolons(t *testing.T) {
+	defer func(old func(string, io.Reader) (io.Reader, error)) { CharsetReader = old }(CharsetReader)
+	CharsetReader = func(charset string, input io.Reader) (io.Reader, error) {
+		if charset != "iso-8859-1" {
+			return nil, errors.New("unexpected charset " + charset)
+		}
+		return charmap.ISO8859_1.NewDecoder().Reader(input), nil
+	}
+
+	for _, suffix := range []string{";", ";;", "; ;"} {
+		raw := "Content-Type: text/plain; charset=iso-8859-1" + suffix + "\r\n" +
+			"\r\n" +
+			"caf\xe9 words\r\n"
+		e, err := Read(strings.NewReader(raw))
+		if err != nil {
+			t.Errorf("suffix %q: Read() = %v, want no error", suffix, err)
+			continue
+		}
+		if b, err := ioutil.ReadAll(e.Body); err != nil {
+			t.Errorf("suffix %q: reading entity body: %v", suffix, err)
+		} else if s := string(b); s != "café words\r\n" {
+			t.Errorf("suffix %q: entity body = %q, want %q", suffix, s, "café words\r\n")
+		}
+	}
+}
+
+func TestRead_boundaryTrailingSemicolons(t *testing.T) {
+	for _, suffix := range []string{";", ";;", "; ;"} {
+		raw := "Content-Type: multipart/alternative; boundary=b1" + suffix + "\r\n" +
+			"\r\n" +
+			"--b1\r\n" +
+			"Content-Type: text/plain; charset=utf-8\r\n" +
+			"\r\n" +
+			"hello words\r\n" +
+			"--b1--\r\n"
+		e, err := Read(strings.NewReader(raw))
+		if err != nil {
+			t.Fatalf("suffix %q: Read() = %v", suffix, err)
+		}
+		mr := e.MultipartReader()
+		if mr == nil {
+			t.Fatalf("suffix %q: MultipartReader() = nil", suffix)
+		}
+		p, err := mr.NextPart()
+		if err != nil {
+			t.Errorf("suffix %q: NextPart() = %v, want the text part", suffix, err)
+			continue
+		}
+		if b, err := ioutil.ReadAll(p.Body); err != nil {
+			t.Errorf("suffix %q: reading part body: %v", suffix, err)
+		} else if s := string(b); s != "hello words" {
+			t.Errorf("suffix %q: part body = %q, want %q", suffix, s, "hello words")
+		}
 	}
 }
