@@ -108,7 +108,16 @@ func (h *Header) SetContentType(t string, params map[string]string) {
 // ContentDisposition parses the Content-Disposition header field, as defined in
 // RFC 2183.
 func (h *Header) ContentDisposition() (disp string, params map[string]string, err error) {
-	return parseHeaderWithParams(h.Get("Content-Disposition"))
+	value := h.Get("Content-Disposition")
+	disp, params, err = parseHeaderWithParams(value)
+	if err != nil {
+		if repaired, ok := quoteUnquotedFilename(value); ok {
+			if rd, rp, re := parseHeaderWithParams(repaired); re == nil {
+				return rd, rp, nil
+			}
+		}
+	}
+	return disp, params, err
 }
 
 // SetContentDisposition formats the Content-Disposition header field, as
