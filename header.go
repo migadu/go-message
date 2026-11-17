@@ -107,6 +107,10 @@ func (h *Header) SetContentType(t string, params map[string]string) {
 
 // ContentDisposition parses the Content-Disposition header field, as defined in
 // RFC 2183.
+//
+// For compatibility, an otherwise valid field may contain an unquoted ASCII
+// filename with internal spaces. This recovery requires one plain filename,
+// no filename* forms, and well-formed UTF-8; the stored header is unchanged.
 func (h *Header) ContentDisposition() (disp string, params map[string]string, err error) {
 	value := h.Get("Content-Disposition")
 	disp, params, err = parseHeaderWithParams(value)
