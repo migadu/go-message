@@ -92,6 +92,8 @@ func HeaderFromMap(m map[string][]string) Header {
 // ContentType parses the Content-Type header field.
 //
 // If no Content-Type is specified, it returns "text/plain".
+// This method has no multipart context; Entity.ContentType reports the
+// effective type used when a message entity was created.
 func (h *Header) ContentType() (t string, params map[string]string, err error) {
 	v := h.Get("Content-Type")
 	if v == "" {
