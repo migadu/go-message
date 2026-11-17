@@ -70,28 +70,54 @@ func (p *headerParser) consumeComment() (string, bool) {
 	// '(' already consumed.
 	depth := 1
 
-	var comment string
+	var comment strings.Builder
 	for {
 		if p.empty() || depth == 0 {
 			break
 		}
 
-		if p.peek() == '\\' && p.len() > 1 {
+		r, size := utf8.DecodeRuneInString(p.s)
+		if r == utf8.RuneError && size == 1 {
+			return "", false
+		}
+		p.s = p.s[size:]
+		switch r {
+		case '\\':
+			if p.empty() {
+				return "", false
+			}
+			r, size = utf8.DecodeRuneInString(p.s)
+			if r == utf8.RuneError && size == 1 || r == 0 || r == '\r' || r == '\n' {
+				return "", false
+			}
+			p.s = p.s[size:]
+			comment.WriteRune(r)
+			continue
+		case '\r':
+			// Raw folding is valid only as CRLF followed by WSP. Usually
+			// the message header reader has already unfolded it.
+			if len(p.s) < 2 || p.s[0] != '\n' || (p.s[1] != ' ' && p.s[1] != '\t') {
+				return "", false
+			}
 			p.s = p.s[1:]
-		} else if p.peek() == '(' {
+			comment.WriteString("\r\n")
+			continue
+		case 0, '\n':
+			return "", false
+		case '(':
 			depth++
-		} else if p.peek() == ')' {
+		case ')':
 			depth--
 		}
 
 		if depth > 0 {
-			comment += p.s[:1]
+			// Preserve obsolete ctext controls, including DEL. NUL and
+			// malformed UTF-8/folding are rejected above, also in escapes.
+			comment.WriteRune(r)
 		}
-
-		p.s = p.s[1:]
 	}
 
-	return comment, depth == 0
+	return comment.String(), depth == 0
 }
 
 func (p *headerParser) parseAtomText(dot bool) (string, error) {
@@ -171,6 +197,100 @@ func isDtext(r rune) bool {
 	return isVchar(r)
 }
 
+func (p *headerParser) parseQuotedString() (string, error) {
+	if !p.consume('"') {
+		return "", errors.New("mail: missing quote in quoted-string")
+	}
+	var b strings.Builder
+	for !p.empty() {
+		r, size := utf8.DecodeRuneInString(p.s)
+		if r == utf8.RuneError && size == 1 {
+			return "", errors.New("mail: invalid UTF-8 in quoted-string")
+		}
+		p.s = p.s[size:]
+		if r == '"' {
+			return b.String(), nil
+		}
+		if r == '\\' {
+			if p.empty() {
+				break
+			}
+			r, size = utf8.DecodeRuneInString(p.s)
+			if r == utf8.RuneError && size == 1 {
+				return "", errors.New("mail: invalid UTF-8 in quoted-pair")
+			}
+			p.s = p.s[size:]
+		}
+		if r != ' ' && r != '\t' && !isVchar(r) {
+			return "", errors.New("mail: invalid character in quoted-string")
+		}
+		b.WriteRune(r)
+	}
+	return "", errors.New("mail: unterminated quoted-string")
+}
+
+// formatMsgIDLocalPart uses dot-atom form when possible, normalizing equivalent
+// quoting for comparisons (RFC 5256 section 2.2.2). Otherwise it retains the
+// quoting needed for the identifier to remain usable in a header field.
+func formatMsgIDLocalPart(s string) string {
+	atom := s != "" && s[0] != '.' && s[len(s)-1] != '.' && !strings.Contains(s, "..")
+	for _, r := range s {
+		if !isAtext(r, true) {
+			atom = false
+			break
+		}
+	}
+	if atom {
+		return s
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		if r == '"' || r == '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+func (p *headerParser) parseMsgIDLocalPart() (string, error) {
+	// Keep the ordinary dot-atom path allocation-free. Quoted words and CFWS
+	// require the obsolete local-part grammar from RFC 5322 section 4.5.4.
+	saved := p.s
+	if atom, err := p.parseAtomText(true); err == nil && !p.empty() && p.peek() == '@' {
+		return atom, nil
+	}
+	p.s = saved
+
+	var b strings.Builder
+	for {
+		if !p.skipCFWS() {
+			return "", errors.New("mail: malformed parenthetical comment")
+		}
+		var word string
+		var err error
+		if !p.empty() && p.peek() == '"' {
+			word, err = p.parseQuotedString()
+		} else {
+			word, err = p.parseAtomText(false)
+		}
+		if err != nil {
+			return "", err
+		}
+		b.WriteString(word)
+		if !p.skipCFWS() {
+			return "", errors.New("mail: malformed parenthetical comment")
+		}
+		if !p.consume('.') {
+			break
+		}
+		b.WriteByte('.')
+	}
+	return formatMsgIDLocalPart(b.String()), nil
+}
+
 func (p *headerParser) parseMsgID() (string, error) {
 	if !p.skipCFWS() {
 		return "", errors.New("mail: malformed parenthetical comment")
@@ -180,13 +300,16 @@ func (p *headerParser) parseMsgID() (string, error) {
 		return "", errors.New("mail: missing '<' in msg-id")
 	}
 
-	left, err := p.parseAtomText(true)
+	left, err := p.parseMsgIDLocalPart()
 	if err != nil {
 		return "", err
 	}
 
 	if !p.consume('@') {
 		return "", errors.New("mail: missing '@' in msg-id")
+	}
+	if !p.skipCFWS() {
+		return "", errors.New("mail: malformed parenthetical comment")
 	}
 
 	var right string
@@ -198,6 +321,9 @@ func (p *headerParser) parseMsgID() (string, error) {
 	}
 	if err != nil {
 		return "", err
+	}
+	if !p.skipCFWS() {
+		return "", errors.New("mail: malformed parenthetical comment")
 	}
 
 	if !p.consume('>') {
@@ -283,6 +409,9 @@ func (h *Header) SetSubject(s string) {
 // MessageID parses the Message-ID field. It returns the message identifier,
 // without the angle brackets. If the message doesn't have a Message-ID header
 // field, it returns an empty string.
+//
+// Comments and unnecessary local-part quoting are removed. Quoting required
+// to keep the identifier valid is retained, allowing SetMessageID to write it.
 func (h *Header) MessageID() (string, error) {
 	v := h.Get("Message-Id")
 	if v == "" {
@@ -301,8 +430,8 @@ func (h *Header) MessageID() (string, error) {
 }
 
 // MsgIDList parses a list of message identifiers. It returns message
-// identifiers without angle brackets. If the header field is missing, it
-// returns nil.
+// identifiers without angle brackets, normalized as described by MessageID.
+// If the header field is missing, it returns nil.
 //
 // This can be used on In-Reply-To and References header fields.
 func (h *Header) MsgIDList(key string) ([]string, error) {
