@@ -73,7 +73,8 @@ func CreateReader(r io.Reader) (*Reader, error) {
 }
 
 // NextPart returns the next mail part. If there is no more part, io.EOF is
-// returned as error.
+// returned as error. If a multipart input ends before its closing delimiter,
+// the error wraps io.ErrUnexpectedEOF.
 //
 // The returned Part.Body must be read completely before the next call to
 // NextPart, otherwise it will be discarded.
