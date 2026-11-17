@@ -2,12 +2,32 @@ package message
 
 import (
 	"mime"
+	"strings"
 
 	"github.com/emersion/go-message/textproto"
 )
 
+// parseMediaType is mime.ParseMediaType, retried once without trailing
+// semicolons and white space when it fails. mime.ParseMediaType ignores a
+// single trailing ";" but rejects ";;" and "; ;", which would otherwise lose
+// every parameter: the charset, the multipart boundary, the filename. A value
+// the strict parser accepts is parsed once; one the retry cannot fix keeps the
+// strict parser's result.
+func parseMediaType(s string) (string, map[string]string, error) {
+	f, params, err := mime.ParseMediaType(s)
+	if err == nil {
+		return f, params, nil
+	}
+	if trimmed := strings.TrimRight(strings.TrimSpace(s), "; \t"); trimmed != s {
+		if tf, tparams, terr := mime.ParseMediaType(trimmed); terr == nil {
+			return tf, tparams, nil
+		}
+	}
+	return f, params, err
+}
+
 func parseHeaderWithParams(s string) (f string, params map[string]string, err error) {
-	f, params, err = mime.ParseMediaType(s)
+	f, params, err = parseMediaType(s)
 	if err != nil {
 		// mime.ParseMediaType still returns a usable media type when only a
 		// parameter is invalid (e.g. an unquoted filename with a space). Keep
