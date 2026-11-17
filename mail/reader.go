@@ -101,7 +101,7 @@ func (r *Reader) NextPart() (*Part, error) {
 		} else {
 			// This is a non-multipart part, return a mail part
 			mp := &Part{Body: p.Body}
-			t, _, _ := p.Header.ContentType()
+			t, _, _ := p.ContentType()
 			disp, _, _ := p.Header.ContentDisposition()
 			if disp == "inline" || (disp != "attachment" && strings.HasPrefix(t, "text/")) {
 				mp.Header = &InlineHeader{p.Header}

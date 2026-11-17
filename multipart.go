@@ -21,6 +21,9 @@ type MultipartReader interface {
 type multipartReader struct {
 	r *textproto.MultipartReader
 
+	// Only immediate children of multipart/digest default to message/rfc822.
+	defaultMediaType string
+
 	// maxHeaderBytes is inherited from the parent entity and propagated to
 	// child parts so that nested multiparts honor the same limit. Zero means
 	// the textproto default.
@@ -33,7 +36,7 @@ func (r *multipartReader) NextPart() (*Entity, error) {
 	if err != nil {
 		return nil, err
 	}
-	e, err := New(Header{p.Header}, p)
+	e, err := newEntity(Header{p.Header}, p, r.defaultMediaType)
 	if e != nil {
 		e.maxHeaderBytes = r.maxHeaderBytes
 	}

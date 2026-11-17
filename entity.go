@@ -20,6 +20,7 @@ type Entity struct {
 
 	mediaType   string
 	mediaParams map[string]string
+	mediaErr    error
 
 	// maxHeaderBytes bounds the header block of each MIME part within this
 	// entity. Zero means the textproto default; it is populated from
@@ -34,9 +35,16 @@ type Entity struct {
 // error that verifies IsUnknownCharset, but also returns an Entity that can
 // be read.
 func New(header Header, body io.Reader) (*Entity, error) {
+	return newEntity(header, body, "text/plain")
+}
+
+func newEntity(header Header, body io.Reader, defaultMediaType string) (*Entity, error) {
 	var err error
 
-	mediaType, mediaParams, _ := header.ContentType()
+	mediaType, mediaParams, mediaErr := header.ContentType()
+	if !header.Has("Content-Type") {
+		mediaType = defaultMediaType
+	}
 
 	// QUIRK: RFC 2045 section 6.4 specifies that multipart messages can't have
 	// a Content-Transfer-Encoding other than "7bit", "8bit" or "binary".
@@ -68,7 +76,26 @@ func New(header Header, body io.Reader) (*Entity, error) {
 		Body:        body,
 		mediaType:   mediaType,
 		mediaParams: mediaParams,
+		mediaErr:    mediaErr,
 	}, err
+}
+
+// ContentType returns the effective media type and parameters used when the
+// entity was created. A missing Content-Type defaults to text/plain, except
+// for a direct child read from multipart/digest, where RFC 2046 section 5.1.5
+// specifies message/rfc822. This default does not add a header field.
+//
+// Later changes to Header do not change this result or how Body is decoded.
+// The returned parameters may be modified without affecting the entity.
+func (e *Entity) ContentType() (string, map[string]string, error) {
+	var params map[string]string
+	if e.mediaParams != nil {
+		params = make(map[string]string, len(e.mediaParams))
+		for k, v := range e.mediaParams {
+			params[k] = v
+		}
+	}
+	return e.mediaType, params, e.mediaErr
 }
 
 // NewMultipart makes a new multipart message with the provided header and
@@ -187,7 +214,11 @@ func (e *Entity) MultipartReader() MultipartReader {
 	if e.maxHeaderBytes != 0 {
 		tr.MaxHeaderBytes = e.maxHeaderBytes
 	}
-	return &multipartReader{r: tr, maxHeaderBytes: e.maxHeaderBytes}
+	defaultMediaType := "text/plain"
+	if e.mediaType == "multipart/digest" {
+		defaultMediaType = "message/rfc822"
+	}
+	return &multipartReader{r: tr, maxHeaderBytes: e.maxHeaderBytes, defaultMediaType: defaultMediaType}
 }
 
 // writeBodyTo writes this entity's body to w (without the header).
