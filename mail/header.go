@@ -70,28 +70,54 @@ func (p *headerParser) consumeComment() (string, bool) {
 	// '(' already consumed.
 	depth := 1
 
-	var comment string
+	var comment strings.Builder
 	for {
 		if p.empty() || depth == 0 {
 			break
 		}
 
-		if p.peek() == '\\' && p.len() > 1 {
+		r, size := utf8.DecodeRuneInString(p.s)
+		if r == utf8.RuneError && size == 1 {
+			return "", false
+		}
+		p.s = p.s[size:]
+		switch r {
+		case '\\':
+			if p.empty() {
+				return "", false
+			}
+			r, size = utf8.DecodeRuneInString(p.s)
+			if r == utf8.RuneError && size == 1 || r == 0 || r == '\r' || r == '\n' {
+				return "", false
+			}
+			p.s = p.s[size:]
+			comment.WriteRune(r)
+			continue
+		case '\r':
+			// Raw folding is valid only as CRLF followed by WSP. Usually
+			// the message header reader has already unfolded it.
+			if len(p.s) < 2 || p.s[0] != '\n' || (p.s[1] != ' ' && p.s[1] != '\t') {
+				return "", false
+			}
 			p.s = p.s[1:]
-		} else if p.peek() == '(' {
+			comment.WriteString("\r\n")
+			continue
+		case 0, '\n':
+			return "", false
+		case '(':
 			depth++
-		} else if p.peek() == ')' {
+		case ')':
 			depth--
 		}
 
 		if depth > 0 {
-			comment += p.s[:1]
+			// Preserve obsolete ctext controls, including DEL. NUL and
+			// malformed UTF-8/folding are rejected above, also in escapes.
+			comment.WriteRune(r)
 		}
-
-		p.s = p.s[1:]
 	}
 
-	return comment, depth == 0
+	return comment.String(), depth == 0
 }
 
 func (p *headerParser) parseAtomText(dot bool) (string, error) {
