@@ -60,7 +60,7 @@ func encodingReader(enc string, r io.Reader) (io.Reader, error) {
 		// Wrap with lenient QP reader to handle malformed QP encoding
 		// (e.g., "= " followed by whitespace which some encoders produce)
 		wrapped := &lenientQPReader{wrapped: bufio.NewReader(r)}
-		dec = quotedprintable.NewReader(wrapped)
+		dec = quotedprintable.NewReader(newQPLineReader(wrapped))
 	case "base64":
 		wrapped := &whitespaceReplacingReader{wrapped: r}
 		dec = base64.NewDecoder(base64.StdEncoding, wrapped)
