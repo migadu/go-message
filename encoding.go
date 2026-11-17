@@ -27,9 +27,35 @@ func IsUnknownEncoding(err error) bool {
 	return errors.As(err, new(UnknownEncodingError))
 }
 
+// encodingMechanism returns the mechanism a Content-Transfer-Encoding field
+// value names, without the comments around it: MIME header fields "can
+// include RFC 822 comments, which have no semantic content and should be
+// ignored during MIME processing" (RFC 2045 section 1).
+func encodingMechanism(enc string) string {
+	if !strings.ContainsRune(enc, '(') {
+		return enc
+	}
+	var b strings.Builder
+	depth := 0
+	for i := 0; i < len(enc); i++ {
+		switch c := enc[i]; {
+		case depth > 0 && c == '\\':
+			i++ // quoted-pair
+		case c == '(':
+			depth++
+			b.WriteByte(' ') // a comment separates tokens
+		case depth > 0 && c == ')':
+			depth--
+		case depth == 0:
+			b.WriteByte(c)
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
 func encodingReader(enc string, r io.Reader) (io.Reader, error) {
 	var dec io.Reader
-	switch strings.ToLower(enc) {
+	switch strings.ToLower(encodingMechanism(enc)) {
 	case "quoted-printable":
 		// Wrap with lenient QP reader to handle malformed QP encoding
 		// (e.g., "= " followed by whitespace which some encoders produce)
@@ -56,7 +82,7 @@ func (nopCloser) Close() error {
 
 func encodingWriter(enc string, w io.Writer) (io.WriteCloser, error) {
 	var wc io.WriteCloser
-	switch strings.ToLower(enc) {
+	switch strings.ToLower(encodingMechanism(enc)) {
 	case "quoted-printable":
 		wc = quotedprintable.NewWriter(w)
 	case "base64":

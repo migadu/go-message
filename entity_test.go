@@ -359,6 +359,23 @@ func TestNew_unknownTransferEncoding(t *testing.T) {
 	}
 }
 
+func TestRead_transferEncodingComment(t *testing.T) {
+	const raw = "Content-Type: text/plain\r\n" +
+		"Content-Transfer-Encoding: base64 (encoded)\r\n" +
+		"\r\n" +
+		"aGVsbG8gd29ybGQK\r\n"
+
+	e, err := Read(strings.NewReader(raw))
+	if err != nil {
+		t.Fatalf("Read() = %v, want no error", err)
+	}
+	if b, err := ioutil.ReadAll(e.Body); err != nil {
+		t.Errorf("reading entity body: %v", err)
+	} else if s := string(b); s != "hello world\n" {
+		t.Errorf("entity body = %q, want %q", s, "hello world\n")
+	}
+}
+
 func TestNew_unknownCharset(t *testing.T) {
 	var h Header
 	h.Set("Content-Type", "text/plain; charset=I-DONT-EXIST")
