@@ -202,12 +202,12 @@ func scanUntilBoundary(buf, dashBoundary, nlDashBoundary []byte, total int64, re
 // and the caller has verified already that bytes.HasPrefix(buf, prefix) is true.
 //
 // matchAfterPrefix returns +1 if the buffer does match the boundary,
-// meaning the prefix is followed by a dash, space, tab, cr, nl, or end of input.
+// meaning the prefix is followed by two dashes, space, tab, cr, nl, or end of input.
 // It returns -1 if the buffer definitely does NOT match the boundary,
 // meaning the prefix is followed by some other character.
 // For example, "--foobar" does not match "--foo".
 // It returns 0 more input needs to be read to make the decision,
-// meaning that len(buf) == len(prefix) and readErr == nil.
+// meaning that the prefix or its closing double dash is incomplete and readErr == nil.
 func matchAfterPrefix(buf, prefix []byte, readErr error) int {
 	if len(buf) == len(prefix) {
 		if readErr != nil {
@@ -216,8 +216,17 @@ func matchAfterPrefix(buf, prefix []byte, readErr error) int {
 		return 0
 	}
 	c := buf[len(prefix)]
-	if c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '-' {
+	if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
 		return +1
+	}
+	if c == '-' {
+		if len(buf) == len(prefix)+1 {
+			if readErr == nil {
+				return 0 // wait for the second closing dash
+			}
+		} else if buf[len(prefix)+1] == '-' {
+			return +1
+		}
 	}
 	return -1
 }
@@ -241,6 +250,7 @@ type MultipartReader struct {
 
 	currentPart *Part
 	partsRead   int
+	done        bool
 
 	nl               []byte // "\r\n" or "\n" (set after seeing first boundary line)
 	nlDashBoundary   []byte // nl + "--boundary"
@@ -251,6 +261,9 @@ type MultipartReader struct {
 // NextPart returns the next part in the multipart or an error.
 // When there are no more parts, the error io.EOF is returned.
 func (r *MultipartReader) NextPart() (*Part, error) {
+	if r.done {
+		return nil, io.EOF
+	}
 	if r.currentPart != nil {
 		r.currentPart.Close()
 	}
@@ -259,16 +272,16 @@ func (r *MultipartReader) NextPart() (*Part, error) {
 	}
 	expectNewPart := false
 	for {
-		line, err := r.bufReader.ReadSlice('\n')
-
-		if err == io.EOF && r.isFinalBoundary(line) {
-			// If the buffer ends in "--boundary--" without the
-			// trailing "\r\n", ReadSlice will return an error
-			// (since it's missing the '\n'), but this is a valid
-			// multipart EOF so we need to return io.EOF instead of
-			// a fmt-wrapped one.
+		// A complete closing marker ends the multipart immediately. Its
+		// epilogue need not fit in the buffer or have arrived yet, and must
+		// never be interpreted as more parts on subsequent calls.
+		prefix, _ := r.bufReader.Peek(len(r.dashBoundaryDash))
+		if r.isFinalBoundary(prefix) {
+			r.done = true
 			return nil, io.EOF
 		}
+
+		line, err := r.bufReader.ReadSlice('\n')
 		if err != nil {
 			return nil, fmt.Errorf("multipart: NextPart: %v", err)
 		}
@@ -281,11 +294,6 @@ func (r *MultipartReader) NextPart() (*Part, error) {
 			}
 			r.currentPart = bp
 			return bp, nil
-		}
-
-		if r.isFinalBoundary(line) {
-			// Expected EOF
-			return nil, io.EOF
 		}
 
 		if expectNewPart {
@@ -312,9 +320,8 @@ func (r *MultipartReader) NextPart() (*Part, error) {
 
 // isFinalBoundary reports whether line is the final boundary line
 // indicating that all parts are over.
-// It matches `^--boundary--`: RFC 2046 section 5.1.1 does not require the
-// boundary to match the entire line, and whatever follows the close
-// delimiter is part of the epilogue, which is ignored.
+// It matches `^--boundary--`. Accept text on the same line for compatibility,
+// consistently with the part body scanner, which already stops at this prefix.
 func (mr *MultipartReader) isFinalBoundary(line []byte) bool {
 	return bytes.HasPrefix(line, mr.dashBoundaryDash)
 }
