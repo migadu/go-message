@@ -16,6 +16,7 @@ func TestHeader_unquotedFilenameSpaces(t *testing.T) {
 		{`attachment; size=42; filename=Quarterly report.pdf; description="A; \"quoted\" note"`, "Quarterly report.pdf"},
 		{`attachment; description="literal (parentheses); filename=decoy.txt"; filename=real report.pdf`, "real report.pdf"},
 		{"attachment; description=\"A\tB\"; filename=real report.pdf", "real report.pdf"},
+		{"attachment; description=\"café\"; filename=real report.pdf", "real report.pdf"},
 		{"attachment; filename=report 'v2'.pdf", "report 'v2'.pdf"},
 		{"attachment; filename=report final.pdf;;", "report final.pdf"},
 		{"attachment; filename=report final.pdf; \t;", "report final.pdf"},
@@ -57,6 +58,9 @@ func TestHeader_unquotedFilenameInvalidPreservesError(t *testing.T) {
 		"attachment; filename=report final.pdf; description=\"bad\nvalue\"",
 		"attachment; filename=report final.pdf; description=\"bad\x7fvalue\"",
 		"attachment; filename=report final.pdf; description=\"bad\\\x00value\"",
+		"attachment; filename=report final.pdf; description=\"bad\xffvalue\"",
+		"attachment; filename=report final.pdf; description=\"bad\\\xffvalue\"",
+		"attachment; filename=report final.pdf; description=\"bad\xed\xa0\x80value\"",
 		`attachment; description="closed"junk; filename=report final.pdf`,
 		`attachment; description="unclosed; filename=report final.pdf`,
 		`attachment; description=oops"; filename=report final.pdf`,
@@ -92,6 +96,8 @@ func TestHeader_unquotedFilenameKeepsStrictInputs(t *testing.T) {
 		`attachment; filename="legacy final.pdf"; filename*=UTF-8''preferred%20final.pdf`,
 		`attachment; filename="legacy.pdf"; filename*0*=UTF-8''preferred; filename*1*=%20final.pdf`,
 		`attachment; filename="report.pdf"; filename="report.pdf"`,
+		"attachment; description=\"bad\xffvalue\"; filename=report.pdf",
+		"attachment; filename=\"bad\xffvalue.pdf\"",
 	} {
 		wantDisp, wantParams, wantErr := parseHeaderWithParams(value)
 		if wantErr != nil {
