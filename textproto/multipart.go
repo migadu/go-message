@@ -259,7 +259,8 @@ type MultipartReader struct {
 }
 
 // NextPart returns the next part in the multipart or an error.
-// When there are no more parts, the error io.EOF is returned.
+// When the closing delimiter is reached, io.EOF is returned. If the input ends
+// before the closing delimiter, the error wraps io.ErrUnexpectedEOF.
 func (r *MultipartReader) NextPart() (*Part, error) {
 	if r.done {
 		return nil, io.EOF
@@ -283,7 +284,10 @@ func (r *MultipartReader) NextPart() (*Part, error) {
 
 		line, err := r.bufReader.ReadSlice('\n')
 		if err != nil {
-			return nil, fmt.Errorf("multipart: NextPart: %v", err)
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
+			return nil, fmt.Errorf("multipart: NextPart: %w", err)
 		}
 
 		if r.isBoundaryDelimiterLine(line) {

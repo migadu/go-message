@@ -11,7 +11,8 @@ type MultipartReader interface {
 	io.Closer
 
 	// NextPart returns the next part in the multipart or an error. When there are
-	// no more parts, the error io.EOF is returned.
+	// no more parts, the error io.EOF is returned. If the input ends before the
+	// closing delimiter, the error wraps io.ErrUnexpectedEOF.
 	//
 	// Entity.Body must be read completely before the next call to NextPart,
 	// otherwise it will be discarded.
